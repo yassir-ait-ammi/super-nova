@@ -9,11 +9,6 @@ tenant isolation) and
 with explicit permission grants, suspension/reactivation/removal, Administrator promotion, and
 atomic ownership transfer).
 
-See [`assessment-docs/`](assessment-docs/) for the assessment brief this implements, and
-[`SUBMISSION.md`](SUBMISSION.md) for delivered scope, known limitations, and architecture notes.
-
-## Stack
-
 Strict TypeScript throughout · Next.js (web) · NestJS (API) · PostgreSQL + Prisma + hand-reviewed
 SQL migrations for forced row-level security · Resend or Gmail SMTP (transactional email) ·
 Vitest (unit + integration) · Playwright (E2E) · pnpm workspaces + Turborepo.
