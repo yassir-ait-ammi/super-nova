@@ -1,0 +1,448 @@
+// NOVA — Prisma schema
+//
+// Tenant boundary: Organization is the ONLY tenant boundary (SEC-01). Every
+// tenant-owned table below carries a non-null `organizationId`, is protected
+// by forced row-level security (see migrations/*_rls_and_constraints), and
+// uses a composite Organization-aware foreign key on its parent relation
+// (SEC-04). Identity/PasswordCredential/Session/PlatformAdministrator are
+// platform-global (not tenant-owned) — a customer identity is linked to at
+// most one Organization through Membership (SEC-13), enforced at the
+// application layer plus a partial unique index.
+
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "postgresql"
+  url      = env("MIGRATOR_DATABASE_URL")
+}
+
+// ---------------------------------------------------------------------------
+// Identity & authentication (platform-global)
+// ---------------------------------------------------------------------------
+
+model Identity {
+  id              String   @id @default(uuid()) @db.Uuid
+  normalizedEmail String   @unique @map("normalized_email")
+  displayEmail    String   @map("display_email")
+  createdAt       DateTime @default(now()) @map("created_at")
+  updatedAt       DateTime @updatedAt @map("updated_at")
+
+  passwordCredential    PasswordCredential?
+  platformAdministrator PlatformAdministrator?
+  sessions              Session[]
+  memberships           Membership[]
+  passwordResetTokens   PasswordResetToken[]
+  acceptedInvitations   Invitation[]           @relation("AcceptedByIdentity")
+
+  @@map("identities")
+}
+
+model PasswordCredential {
+  id                String   @id @default(uuid()) @db.Uuid
+  identityId        String   @unique @map("identity_id") @db.Uuid
+  argon2Hash        String   @map("argon2_hash")
+  createdAt         DateTime @default(now()) @map("created_at")
+  passwordChangedAt DateTime @default(now()) @map("password_changed_at")
+
+  identity Identity @relation(fields: [identityId], references: [id], onDelete: Cascade)
+
+  @@map("password_credentials")
+}
+
+model Session {
+  id            String    @id @default(uuid()) @db.Uuid
+  identityId    String    @map("identity_id") @db.Uuid
+  tokenHash     String    @unique @map("token_hash")
+  csrfSecret    String    @map("csrf_secret")
+  createdAt     DateTime  @default(now()) @map("created_at")
+  lastSeenAt    DateTime  @default(now()) @map("last_seen_at")
+  expiresAt     DateTime  @map("expires_at")
+  revokedAt     DateTime? @map("revoked_at")
+  revokedReason String?   @map("revoked_reason")
+  ipAddress     String?   @map("ip_address")
+  userAgent     String?   @map("user_agent")
+
+  identity Identity @relation(fields: [identityId], references: [id], onDelete: Cascade)
+
+  @@index([identityId])
+  @@map("sessions")
+}
+
+model PlatformAdministrator {
+  id         String   @id @default(uuid()) @db.Uuid
+  identityId String   @unique @map("identity_id") @db.Uuid
+  isActive   Boolean  @default(true) @map("is_active")
+  createdAt  DateTime @default(now()) @map("created_at")
+
+  identity Identity @relation(fields: [identityId], references: [id], onDelete: Cascade)
+
+  @@map("platform_administrators")
+}
+
+// Durable record used for SEC-16 progressive-delay login throttling by account and by source.
+model LoginAttempt {
+  id              String   @id @default(uuid()) @db.Uuid
+  normalizedEmail String   @map("normalized_email")
+  ipAddress       String   @map("ip_address")
+  succeeded       Boolean
+  createdAt       DateTime @default(now()) @map("created_at")
+
+  @@index([normalizedEmail, createdAt])
+  @@index([ipAddress, createdAt])
+  @@map("login_attempts")
+}
+
+model PasswordResetToken {
+  id         String    @id @default(uuid()) @db.Uuid
+  identityId String    @map("identity_id") @db.Uuid
+  tokenHash  String    @unique @map("token_hash")
+  expiresAt  DateTime  @map("expires_at")
+  usedAt     DateTime? @map("used_at")
+  revokedAt  DateTime? @map("revoked_at")
+  createdAt  DateTime  @default(now()) @map("created_at")
+
+  identity Identity @relation(fields: [identityId], references: [id], onDelete: Cascade)
+
+  @@index([identityId])
+  @@map("password_reset_tokens")
+}
+
+// ---------------------------------------------------------------------------
+// Platform administration (tenant root)
+// ---------------------------------------------------------------------------
+
+enum OrganizationAccessStatus {
+  PROVISIONING
+  ACTIVE
+  SUSPENDED
+  DISABLED
+
+  @@map("organization_access_status")
+}
+
+enum OrganizationCommercialStatus {
+  DEMO
+  PILOT
+  ACTIVE
+
+  @@map("organization_commercial_status")
+}
+
+model Organization {
+  id                String                       @id @default(uuid()) @db.Uuid
+  name              String
+  normalizedName    String                       @map("normalized_name")
+  accessStatus      OrganizationAccessStatus     @default(PROVISIONING) @map("access_status")
+  commercialStatus  OrganizationCommercialStatus @default(DEMO) @map("commercial_status")
+  ownerContactEmail String?                      @map("owner_contact_email")
+  version           Int                          @default(0)
+  createdAt         DateTime                     @default(now()) @map("created_at")
+  updatedAt         DateTime                     @updatedAt @map("updated_at")
+  suspendedAt       DateTime?                    @map("suspended_at")
+  disabledAt        DateTime?                    @map("disabled_at")
+
+  companies                  Company[]
+  businessScopes             BusinessScope[]
+  memberships                Membership[]
+  invitations                Invitation[]
+  evidenceRecords            AdminEvidence[]
+  ownershipTransferProposals OwnershipTransferProposal[]
+
+  @@unique([normalizedName])
+  @@map("organizations")
+}
+
+// ---------------------------------------------------------------------------
+// Organization structure: Company / Business Scope (tenant-owned)
+// ---------------------------------------------------------------------------
+
+enum LifecycleStatus {
+  ACTIVE
+  INACTIVE
+
+  @@map("lifecycle_status")
+}
+
+model Company {
+  id             String          @id @default(uuid()) @db.Uuid
+  organizationId String          @map("organization_id") @db.Uuid
+  name           String
+  normalizedName String          @map("normalized_name")
+  status         LifecycleStatus @default(ACTIVE)
+  version        Int             @default(0)
+  createdAt      DateTime        @default(now()) @map("created_at")
+  updatedAt      DateTime        @updatedAt @map("updated_at")
+
+  organization   Organization    @relation(fields: [organizationId], references: [id], onDelete: Restrict)
+  businessScopes BusinessScope[]
+
+  @@unique([organizationId, normalizedName])
+  @@unique([id, organizationId])
+  @@index([organizationId])
+  @@map("companies")
+}
+
+enum BusinessScopeType {
+  RESTAURANT
+  PROPERTY_DEVELOPMENT
+  CONSTRUCTION
+  EVENT
+
+  @@map("business_scope_type")
+}
+
+model BusinessScope {
+  id                String            @id @default(uuid()) @db.Uuid
+  organizationId    String            @map("organization_id") @db.Uuid
+  companyId         String            @map("company_id") @db.Uuid
+  type              BusinessScopeType
+  name              String
+  normalizedName    String            @map("normalized_name")
+  externalId        String?           @map("external_id")
+  location          String?
+  responsiblePerson String?           @map("responsible_person")
+  status            LifecycleStatus   @default(ACTIVE)
+  version           Int               @default(0)
+  createdAt         DateTime          @default(now()) @map("created_at")
+  updatedAt         DateTime          @updatedAt @map("updated_at")
+
+  organization Organization @relation(fields: [organizationId], references: [id], onDelete: Restrict)
+  // Composite, Organization-aware FK: a BusinessScope can only reference a
+  // Company that belongs to the SAME Organization (SEC-04). Enforced via the
+  // composite foreign key below, which requires the matching composite
+  // unique constraint on Company(id, organizationId) — added in the RLS
+  // migration since Prisma does not model "unique + not the PK" composites
+  // used purely for a second incoming FK cleanly.
+  company      Company      @relation(fields: [companyId, organizationId], references: [id, organizationId], onDelete: Restrict)
+
+  @@unique([organizationId, companyId, type, normalizedName])
+  @@unique([id, organizationId])
+  @@index([organizationId])
+  @@index([companyId])
+  @@map("business_scopes")
+}
+
+// ---------------------------------------------------------------------------
+// Access control: memberships, capabilities, scope grants (tenant-owned)
+// ---------------------------------------------------------------------------
+
+enum MembershipProfile {
+  ADMINISTRATOR
+  USER
+
+  @@map("membership_profile")
+}
+
+enum MembershipState {
+  ACTIVE
+  SUSPENDED
+  REMOVED
+
+  @@map("membership_state")
+}
+
+model Membership {
+  id             String            @id @default(uuid()) @db.Uuid
+  organizationId String            @map("organization_id") @db.Uuid
+  identityId     String            @map("identity_id") @db.Uuid
+  profile        MembershipProfile
+  isOwner        Boolean           @default(false) @map("is_owner")
+  state          MembershipState   @default(ACTIVE)
+  presetKey      String?           @map("preset_key")
+  version        Int               @default(0)
+  createdAt      DateTime          @default(now()) @map("created_at")
+  updatedAt      DateTime          @updatedAt @map("updated_at")
+  suspendedAt    DateTime?         @map("suspended_at")
+  removedAt      DateTime?         @map("removed_at")
+
+  organization Organization           @relation(fields: [organizationId], references: [id], onDelete: Restrict)
+  identity     Identity               @relation(fields: [identityId], references: [id], onDelete: Restrict)
+  capabilities MembershipCapability[]
+  scopeGrants  MembershipScopeGrant[]
+
+  @@unique([organizationId, identityId])
+  @@unique([id, organizationId])
+  @@index([organizationId])
+  @@index([identityId])
+  @@map("memberships")
+}
+
+model MembershipCapability {
+  id             String   @id @default(uuid()) @db.Uuid
+  organizationId String   @map("organization_id") @db.Uuid
+  membershipId   String   @map("membership_id") @db.Uuid
+  capability     String
+  grantedAt      DateTime @default(now()) @map("granted_at")
+
+  membership Membership @relation(fields: [membershipId, organizationId], references: [id, organizationId], onDelete: Cascade)
+
+  @@unique([membershipId, capability])
+  @@index([organizationId])
+  @@map("membership_capabilities")
+}
+
+model MembershipScopeGrant {
+  id              String  @id @default(uuid()) @db.Uuid
+  organizationId  String  @map("organization_id") @db.Uuid
+  membershipId    String  @map("membership_id") @db.Uuid
+  companyId       String? @map("company_id") @db.Uuid
+  businessScopeId String? @map("business_scope_id") @db.Uuid
+
+  membership Membership @relation(fields: [membershipId, organizationId], references: [id, organizationId], onDelete: Cascade)
+
+  @@index([organizationId])
+  @@index([membershipId])
+  @@map("membership_scope_grants")
+}
+
+// ---------------------------------------------------------------------------
+// Invitations (tenant-owned)
+// ---------------------------------------------------------------------------
+
+enum InvitationKind {
+  INITIAL_OWNER
+  COLLABORATOR
+
+  @@map("invitation_kind")
+}
+
+enum InvitationStatus {
+  PENDING
+  ACCEPTED
+  EXPIRED
+  REVOKED
+
+  @@map("invitation_status")
+}
+
+model Invitation {
+  id                   String            @id @default(uuid()) @db.Uuid
+  organizationId       String            @map("organization_id") @db.Uuid
+  kind                 InvitationKind
+  normalizedEmail      String            @map("normalized_email")
+  tokenHash            String            @unique @map("token_hash")
+  status               InvitationStatus  @default(PENDING)
+  initialProfile       MembershipProfile @default(USER) @map("initial_profile")
+  expiresAt            DateTime          @map("expires_at")
+  version              Int               @default(0)
+  createdAt            DateTime          @default(now()) @map("created_at")
+  updatedAt            DateTime          @updatedAt @map("updated_at")
+  acceptedAt           DateTime?         @map("accepted_at")
+  revokedAt            DateTime?         @map("revoked_at")
+  acceptedByIdentityId String?           @map("accepted_by_identity_id") @db.Uuid
+  createdByActorLabel  String            @map("created_by_actor_label")
+  // Non-secret, non-identifying intended capabilities/scope grants for a
+  // COLLABORATOR invitation, applied to the Membership atomically on
+  // acceptance and re-validated against currently-active Companies/Business
+  // Scopes at that point (a grant for a Company/Scope deleted or deactivated
+  // since the invite was sent is silently dropped, never resurrected).
+  pendingGrants        Json?             @map("pending_grants")
+  // Display/audit only — the preset the inviter started from. Authorization
+  // always consults the resolved capability rows, never this key.
+  presetKey            String?           @map("preset_key")
+
+  organization       Organization @relation(fields: [organizationId], references: [id], onDelete: Restrict)
+  acceptedByIdentity Identity?    @relation("AcceptedByIdentity", fields: [acceptedByIdentityId], references: [id])
+
+  @@index([organizationId])
+  @@index([normalizedEmail])
+  @@map("invitations")
+}
+
+// ---------------------------------------------------------------------------
+// Ownership transfer (tenant-owned)
+// ---------------------------------------------------------------------------
+
+enum OwnershipTransferStatus {
+  PENDING
+  ACCEPTED
+  CANCELLED
+  EXPIRED
+
+  @@map("ownership_transfer_status")
+}
+
+// The current owner proposes transfer to another active Administrator;
+// nothing changes until that successor accepts while still eligible.
+// Acceptance rechecks proposer ownership, successor eligibility, freshness,
+// and cancellation inside one serialized transaction (FR-089).
+model OwnershipTransferProposal {
+  id                    String                  @id @default(uuid()) @db.Uuid
+  organizationId        String                  @map("organization_id") @db.Uuid
+  proposerMembershipId  String                  @map("proposer_membership_id") @db.Uuid
+  successorMembershipId String                  @map("successor_membership_id") @db.Uuid
+  status                OwnershipTransferStatus @default(PENDING)
+  reason                String
+  expiresAt             DateTime                @map("expires_at")
+  createdAt             DateTime                @default(now()) @map("created_at")
+  resolvedAt            DateTime?               @map("resolved_at")
+
+  organization Organization @relation(fields: [organizationId], references: [id], onDelete: Restrict)
+
+  @@index([organizationId])
+  @@map("ownership_transfer_proposals")
+}
+
+// ---------------------------------------------------------------------------
+// Transactional email (mixed: platform-level operational tables)
+// ---------------------------------------------------------------------------
+
+enum EmailTemplateKey {
+  INITIAL_OWNER_INVITE
+  COLLABORATOR_INVITE
+  PASSWORD_RESET
+
+  @@map("email_template_key")
+}
+
+enum EmailOutboxStatus {
+  PENDING
+  SENT
+  FAILED
+
+  @@map("email_outbox_status")
+}
+
+model EmailOutbox {
+  id              String            @id @default(uuid()) @db.Uuid
+  organizationId  String?           @map("organization_id") @db.Uuid
+  templateKey     EmailTemplateKey  @map("template_key")
+  templateVersion Int               @map("template_version")
+  recipientEmail  String            @map("recipient_email")
+  variables       Json
+  encryptedToken  Bytes?            @map("encrypted_token")
+  status          EmailOutboxStatus @default(PENDING)
+  resendMessageId String?           @map("resend_message_id")
+  attempts        Int               @default(0)
+  lastErrorCode   String?           @map("last_error_code")
+  createdAt       DateTime          @default(now()) @map("created_at")
+  sentAt          DateTime?         @map("sent_at")
+
+  @@index([status])
+  @@map("email_outbox")
+}
+
+// ---------------------------------------------------------------------------
+// Administrative evidence (platform-level operational table)
+// ---------------------------------------------------------------------------
+
+model AdminEvidence {
+  id                   String   @id @default(uuid()) @db.Uuid
+  organizationId       String?  @map("organization_id") @db.Uuid
+  actorIdentityId      String?  @map("actor_identity_id") @db.Uuid
+  actorIsPlatformAdmin Boolean  @map("actor_is_platform_admin")
+  action               String
+  reason               String?
+  beforeState          Json?    @map("before_state")
+  afterState           Json?    @map("after_state")
+  correlationId        String   @map("correlation_id")
+  createdAt            DateTime @default(now()) @map("created_at")
+
+  organization Organization? @relation(fields: [organizationId], references: [id], onDelete: SetNull)
+
+  @@index([organizationId])
+  @@index([actorIdentityId])
+  @@map("admin_evidence")
+}
